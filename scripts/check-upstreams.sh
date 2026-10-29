@@ -20,12 +20,32 @@ latest_ksu_tag() {
   gh api "repos/$KSU_REPO/releases?per_page=30" -q "$filter][0].tag_name"
 }
 
-declare -A NEW REPO
+declare -A NEW REPO ONLY SKIP
 NEW[KERNEL_COMMIT]=$(head_of "$KERNEL_REPO" "$KERNEL_BRANCH");  REPO[KERNEL_COMMIT]=$KERNEL_REPO
 NEW[KSU_TAG]=$(latest_ksu_tag);                                 REPO[KSU_TAG]=$KSU_REPO
 NEW[NONGKI_COMMIT]=$(head_of "$NONGKI_REPO" "$NONGKI_BRANCH");  REPO[NONGKI_COMMIT]=$NONGKI_REPO
 NEW[AK3_COMMIT]=$(head_of "$AK3_REPO" "$AK3_BRANCH");           REPO[AK3_COMMIT]=$AK3_REPO
 NEW[CLANG_COMMIT]=$(head_of "$CLANG_REPO" "$CLANG_BRANCH");     REPO[CLANG_COMMIT]=$CLANG_REPO
+
+# Multi-purpose repos: a new commit counts only if it touches what the build uses (see build.yml).
+# NonGKI serves many devices: only its 4.14 SUSFS patch and hook script are applied.
+ONLY[NONGKI_COMMIT]='^Patches/(Patch/susfs_patch_to_4\.14\.patch|susfs_inline_hook_patches\.sh)$'
+# AnyKernel3 ships as is, minus what build.yml drops or replaces.
+SKIP[AK3_COMMIT]='^(\.github/|README\.md$|anykernel\.sh$)'
+
+# relevant KEY OLD NEW: true when OLD...NEW changes a file the build uses
+relevant() {
+  local files
+  [ -n "${ONLY[$1]:-}${SKIP[$1]:-}" ] || return 0
+  # unknown base (upstream force-push): take the new commit rather than miss a change
+  files=$(gh api "repos/${REPO[$1]}/compare/$2...$3" -q '.files[].filename') || return 0
+  [ -n "$files" ] || return 1
+  if [ -n "${ONLY[$1]:-}" ]; then
+    grep -qE "${ONLY[$1]}" <<< "$files"
+  else
+    grep -vqE "${SKIP[$1]}" <<< "$files"
+  fi
+}
 
 changed=false
 rows=()
@@ -37,6 +57,10 @@ for key in KERNEL_COMMIT KSU_TAG NONGKI_COMMIT AK3_COMMIT CLANG_COMMIT; do
     exit 1
   fi
   [ "$old" = "$new" ] && continue
+  if ! relevant "$key" "$old" "$new"; then
+    echo "-- $key: ${REPO[$key]} moved, but not in files the build uses: kept at ${old:0:12}" >&2
+    continue
+  fi
   changed=true
   sed -i "s|^$key=.*|$key=$new|" "$VERSIONS"
   rows+=("| \`$key\` | \`${old:0:12}\` | [\`${new:0:12}\`](https://github.com/${REPO[$key]}/compare/$old...$new) |")

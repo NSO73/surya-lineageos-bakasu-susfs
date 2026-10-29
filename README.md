@@ -35,7 +35,7 @@ The kernel provides the SUSFS mechanism, but **hides nothing until it is configu
 
 The [`update`](.github/workflows/update.yml) workflow runs daily:
 
-1. [`scripts/check-upstreams.sh`](scripts/check-upstreams.sh) queries every upstream: latest commit of each tracked branch, latest BakaSU release (pre-releases included).
+1. [`scripts/check-upstreams.sh`](scripts/check-upstreams.sh) queries every upstream: latest commit of each tracked branch, latest BakaSU release (pre-releases included). New commits in multi-purpose repos count only if they touch files the build uses: the 4.14 SUSFS patch and hook script for NonGKI, the flashing scripts and tools for AnyKernel3. LineageOS ROM builds never trigger anything: only commits to the surya kernel repo do.
 2. If a version moved, the new `versions.env` is committed on a side branch and built by the [`build`](.github/workflows/build.yml) workflow.
 3. **Build succeeds**: a release is published with the zip, its SHA-256, the version details and the matching manager APK, then `main` moves forward.
 4. **Build fails**: `main` is left untouched, nothing is published, and an `upstream-failure` issue is opened (or updated) with the versions involved and a link to the log.
