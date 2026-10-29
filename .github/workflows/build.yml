@@ -1,0 +1,249 @@
+name: build
+
+# LineageOS surya kernel + ReSukiSU/BakaSU + SUSFS (inline hooks), built only from the
+# upstream refs pinned in versions.env, plus this repo's config/, patches/ and anykernel/.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - versions.env
+      - config/**
+      - patches/**
+      - anykernel/**
+      - .github/workflows/build.yml
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a GitHub release with the zip
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit of this repo to build
+        type: string
+        required: true
+      release:
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      DEFCONFIG: surya_defconfig
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 3G
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          path: ci
+
+      - name: Load pinned versions
+        run: |
+          grep -E '^[A-Z0-9_]+=' ci/versions.env | tee -a "$GITHUB_ENV"
+          echo "CI_SHA=$(git -C ci rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev make libncurses-dev \
+            zip unzip ca-certificates git curl python3 cpio device-tree-compiler ccache
+
+      - name: Fetch base kernel
+        run: |
+          git init -q kernel
+          git -C kernel fetch -q --depth=1 "https://github.com/$KERNEL_REPO" "$KERNEL_COMMIT"
+          git -C kernel checkout -q FETCH_HEAD
+
+      - name: Restore toolchain
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.CLANG_COMMIT }}
+
+      - name: Fetch toolchain
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q clang
+          git -C clang fetch -q --depth=1 "https://github.com/$CLANG_REPO" "$CLANG_COMMIT"
+          git -C clang checkout -q FETCH_HEAD
+          rm -rf clang/.git
+
+      # cache keys are immutable: save under a unique key per run, restore the newest by prefix
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ hashFiles('ci/versions.env', 'ci/config/**', 'ci/patches/**') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ hashFiles('ci/versions.env', 'ci/config/**', 'ci/patches/**') }}-
+            ccache-
+
+      - name: Integrate ReSukiSU / BakaSU
+        working-directory: kernel
+        run: curl -fsSL "https://raw.githubusercontent.com/$KSU_REPO/$KSU_TAG/kernel/setup.sh" | bash -s "$KSU_TAG"
+
+      - name: Fetch NonGKI SUSFS backport
+        run: |
+          mkdir nongki
+          curl -fsSL "https://codeload.github.com/$NONGKI_REPO/tar.gz/$NONGKI_COMMIT" | tar -xz -C nongki --strip-components=1
+
+      - name: Apply SUSFS core patch
+        working-directory: kernel
+        run: |
+          patch -p1 --fuzz=3 --no-backup-if-mismatch < ../nongki/Patches/Patch/susfs_patch_to_4.14.patch || true
+          mapfile -t rejects < <(find . -name '*.rej')
+          if (( ${#rejects[@]} )); then
+            mkdir -p ../rejects
+            for r in "${rejects[@]}"; do cp --parents "$r" ../rejects/; done
+            if ! compgen -G '../ci/patches/*.patch' > /dev/null; then
+              echo "::error::SUSFS core patch no longer applies cleanly: ${rejects[*]} (add a fixup in patches/)"
+              exit 1
+            fi
+            echo "::warning::rejected hunks, relying on patches/: ${rejects[*]}"
+          fi
+          echo "SUSFS_VERSION=$(sed -n 's/.*SUSFS_VERSION "\(.*\)".*/\1/p' include/linux/susfs.h)" >> "$GITHUB_ENV"
+
+      - name: Apply local fixup patches
+        working-directory: kernel
+        run: |
+          shopt -s nullglob
+          for p in ../ci/patches/*.patch; do
+            echo ">> $p"
+            patch -p1 --no-backup-if-mismatch < "$p"
+          done
+          find . -name '*.rej' -delete
+
+      - name: Apply SUSFS inline hooks
+        working-directory: kernel
+        run: |
+          bash ../nongki/Patches/susfs_inline_hook_patches.sh
+          missing=0
+          for h in ksu_handle_setresuid:kernel/sys.c ksu_handle_execveat:fs/exec.c \
+                   ksu_handle_faccessat:fs/open.c ksu_handle_sys_read:fs/read_write.c \
+                   ksu_handle_stat:fs/stat.c ksu_handle_sys_reboot:kernel/reboot.c \
+                   ksu_handle_input_handle_event:drivers/input/input.c; do
+            grep -q "${h%%:*}" "${h#*:}" || { echo "::error::hook ${h%%:*} missing in ${h#*:}"; missing=1; }
+          done
+          exit $missing
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          export PATH="$PATH:$GITHUB_WORKSPACE/clang/bin"
+          export KBUILD_BUILD_USER=ci KBUILD_BUILD_HOST=surya-ci
+          M=(O=out ARCH=arm64 "CC=ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm
+             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf
+             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+             "DTC_EXT=$(command -v dtc)")
+          cat ../ci/config/surya.fragment >> "arch/arm64/configs/$DEFCONFIG"
+          make "${M[@]}" "$DEFCONFIG" > /dev/null
+          missing=0
+          while IFS= read -r line; do
+            [[ $line == CONFIG_* ]] || continue
+            grep -qx "$line" out/.config || { echo "::error::$line dropped by Kconfig (unmet dependency?)"; missing=1; }
+          done < ../ci/config/surya.fragment
+          (( missing == 0 )) || exit 1
+          ccache -z > /dev/null
+          make -j"$(nproc)" "${M[@]}" 2>&1 | tee ../build.log
+          ccache -s
+          echo "KERNEL_RELEASE=$(cat out/include/config/kernel.release)" >> "$GITHUB_ENV"
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ hashFiles('ci/versions.env', 'ci/config/**', 'ci/patches/**') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Package AnyKernel3 zip
+        run: |
+          # kernel-only: the device keeps its ramdisk, dtb and dtbo (same LineageOS tree)
+          mkdir ak3
+          curl -fsSL "https://codeload.github.com/$AK3_REPO/tar.gz/$AK3_COMMIT" | tar -xz -C ak3 --strip-components=1
+          rm -rf ak3/.github ak3/README.md
+          cp ci/anykernel/anykernel.sh ak3/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image.gz ak3/Image.gz
+          ZIP="surya-${KERNEL_RELEASE}-ReSukiSU-${KSU_TAG}-SUSFS-${SUSFS_VERSION}.zip"
+          ( cd ak3 && zip -qr9 "../$ZIP" . )
+          sha256sum "$ZIP" | tee "$ZIP.sha256"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Summary
+        run: |
+          short() { echo "${1:0:12}"; }
+          cat > summary.md <<EOF
+          ### \`$ZIP\`
+          | Component | Version |
+          |---|---|
+          | LineageOS kernel | [\`$KERNEL_BRANCH@$(short "$KERNEL_COMMIT")\`](https://github.com/$KERNEL_REPO/commit/$KERNEL_COMMIT) → \`$KERNEL_RELEASE\` |
+          | ReSukiSU / BakaSU | [\`$KSU_TAG\`](https://github.com/$KSU_REPO/releases/tag/$KSU_TAG) |
+          | SUSFS | \`$SUSFS_VERSION\` via [\`NonGKI@$(short "$NONGKI_COMMIT")\`](https://github.com/$NONGKI_REPO/commit/$NONGKI_COMMIT) |
+          | AnyKernel3 | [\`$(short "$AK3_COMMIT")\`](https://github.com/$AK3_REPO/commit/$AK3_COMMIT) |
+          | Toolchain | [\`proton-clang@$(short "$CLANG_COMMIT")\`](https://github.com/$CLANG_REPO/commit/$CLANG_COMMIT) |
+
+          SHA-256: \`$(cut -d' ' -f1 "$ZIP.sha256")\`
+          EOF
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surya-kernel
+          path: |
+            surya-*.zip
+            surya-*.zip.sha256
+            build.log
+            rejects/
+          if-no-files-found: warn
+
+      - name: Publish release
+        if: inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base="surya-$(date -u +%Y%m%d)-${CI_SHA:0:7}"
+          TAG=$base; n=1
+          while gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; do n=$((n + 1)); TAG="$base.$n"; done
+          rel=$(gh api "repos/$KSU_REPO/releases/tags/$KSU_TAG")
+          APK_NAME=$(jq -r '[.assets[] | select(.name | test("arm64-v8a"))][0].name' <<< "$rel")
+          APK_URL=$(jq -r '[.assets[] | select(.name | test("arm64-v8a"))][0].browser_download_url' <<< "$rel")
+          [ -n "$APK_NAME" ] && [ "$APK_NAME" != null ] || { echo "::error::no arm64-v8a manager APK in $KSU_REPO $KSU_TAG"; exit 1; }
+          PRE=$(jq -r .prerelease <<< "$rel")
+          {
+            echo "LineageOS kernel for the Poco X3 NFC (surya) with ReSukiSU/BakaSU root and SUSFS."
+            echo
+            echo "### Manager APK (required, same version as the kernel)"
+            echo "**[$APK_NAME]($APK_URL)** — from the [BakaSU $KSU_TAG release](https://github.com/$KSU_REPO/releases/tag/$KSU_TAG)."
+            echo
+            cat summary.md
+            echo
+            echo "### Install"
+            echo "1. Back up the current \`boot\` partition (rollback)."
+            echo "2. Flash the zip (recovery, or an AnyKernel3-capable app). Only the kernel is replaced: the device ramdisk, dtb and dtbo are kept."
+            echo "3. Install the manager APK above. **Required**: the manager ships \`ksud\`; with another version no root module starts."
+            echo "4. Open the manager (it updates \`ksud\`), then reboot."
+            echo
+            echo "### Sources"
+            echo "Built by GitHub Actions from the upstream sources above and commit [\`${CI_SHA:0:7}\`](https://github.com/$GITHUB_REPOSITORY/commit/$CI_SHA) of this repository."
+          } > notes.md
+          args=(--repo "$GITHUB_REPOSITORY" --target "$CI_SHA" --notes-file notes.md
+                --title "surya $KERNEL_RELEASE · ReSukiSU $KSU_TAG · SUSFS $SUSFS_VERSION")
+          [ "$PRE" = true ] && args+=(--prerelease)
+          gh release create "$TAG" "$ZIP" "$ZIP.sha256" "${args[@]}"
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" | tee -a "$GITHUB_STEP_SUMMARY"

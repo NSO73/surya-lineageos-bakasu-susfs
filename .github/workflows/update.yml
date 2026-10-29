@@ -1,0 +1,126 @@
+name: update
+
+# Daily: resolve the latest upstream refs. If one moved, commit the new versions.env on a
+# side branch, build it, publish a release, then fast-forward main. On failure main stays
+# untouched and an issue is opened/updated with the version diff.
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and release even without upstream changes
+        type: boolean
+        default: false
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  BUMP_BRANCH: auto/upstream-bump
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check upstreams
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KSU_PRERELEASE: 1
+        run: |
+          set -o pipefail
+          bash scripts/check-upstreams.sh versions.env changelog.md | tee check.out
+          tail -n 1 check.out >> "$GITHUB_OUTPUT"
+          cat changelog.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep changelog
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: changelog.md
+
+      - name: Commit on side branch
+        id: commit
+        if: steps.check.outputs.changed == 'true' || inputs.force
+        run: |
+          if [ '${{ steps.check.outputs.changed }}' = true ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git switch -C "$BUMP_BRANCH"
+            git commit -q -am 'Bump upstream versions' -m "$(cat changelog.md)"
+            git push -qf origin "$BUMP_BRANCH"
+          fi
+          # forced rebuild without upstream change: build main as is, no extra commit
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.sha != ''
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.check.outputs.sha }}
+      release: true
+    permissions:
+      contents: write
+
+  promote:
+    needs: [check, build]
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward main
+        run: |
+          git fetch -q origin "$BUMP_BRANCH"
+          git push origin "${{ needs.check.outputs.sha }}:refs/heads/main"
+          git push -q origin --delete "$BUMP_BRANCH"
+
+  report:
+    needs: [check, build, promote]
+    if: failure()
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LABEL: upstream-failure
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: changelog
+        continue-on-error: true
+
+      - name: Open or update issue
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "Automatic upstream update failed: [run $GITHUB_RUN_ID]($run_url)."
+            echo
+            echo "\`main\` was not changed and nothing was published. Versions tried:"
+            echo
+            cat changelog.md 2>/dev/null || echo "(no changelog: failed before upstream detection)"
+          } > body.md
+          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 --force > /dev/null
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state open --json number -q '.[0].number')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label "$LABEL" \
+              --title 'Upstream update failed' --body-file body.md
+          fi
