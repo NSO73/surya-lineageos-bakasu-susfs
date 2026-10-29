@@ -66,3 +66,7 @@ If an upstream change makes the SUSFS patch stop applying cleanly to the Lineage
 | [Proton Clang](https://github.com/kdrag0n/proton-clang) | kdrag0n | the toolchain |
 
 Each component keeps the license of its original project; the kernel is GPL-2.0.
+
+## License
+
+The files of this repository (workflows, scripts, configuration) are released under the [GPL-2.0](LICENSE), like the kernel they build.
