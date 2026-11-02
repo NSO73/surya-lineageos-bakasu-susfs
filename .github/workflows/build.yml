@@ -44,7 +44,7 @@ jobs:
       CCACHE_MAXSIZE: 3G
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           path: ci
@@ -69,7 +69,7 @@ jobs:
 
       - name: Restore toolchain
         id: clang-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: clang
           key: clang-${{ env.CLANG_COMMIT }}
@@ -84,7 +84,7 @@ jobs:
 
       # cache keys are immutable: save under a unique key per run, restore the newest by prefix
       - name: Restore ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .ccache
           key: ccache-${{ hashFiles('ci/versions.env', 'ci/surya.fragment', 'ci/*.patch') }}-${{ github.run_id }}
@@ -165,7 +165,7 @@ jobs:
 
       - name: Save ccache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .ccache
           key: ccache-${{ hashFiles('ci/versions.env', 'ci/surya.fragment', 'ci/*.patch') }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -202,7 +202,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: surya-kernel
           path: |
